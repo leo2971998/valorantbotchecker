@@ -26,12 +26,14 @@ export const getShop = async (id, account = null) => {
     console.log(`Fetching shop for ${user.username}...`);
 
     // https://github.com/techchrism/valorant-api-docs/blob/trunk/docs/Store/GET%20Store_GetStorefrontV2.md
-    const req = await fetch(`https://pd.${userRegion(user)}.a.pvp.net/store/v2/storefront/${user.puuid}`, {
+    const req = await fetch(`https://pd.${userRegion(user)}.a.pvp.net/store/v3/storefront/${user.puuid}`, {
+        method: "POST",
         headers: {
             "Authorization": "Bearer " + user.auth.rso,
             "X-Riot-Entitlements-JWT": user.auth.ent,
             ...riotClientHeaders(),
-        }
+        },
+        body: JSON.stringify({}),
     });
     console.assert(req.statusCode === 200, `Valorant skins offers code is ${req.statusCode}!`, req);
 
