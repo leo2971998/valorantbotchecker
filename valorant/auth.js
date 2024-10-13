@@ -25,7 +25,7 @@ export class User {
         this.region = region;
         this.authFailures = authFailures || 0;
         this.lastFetchedData = lastFetchedData || 0;
-        this.lastNoticeSeen =  lastNoticeSeen || "";
+        this.lastNoticeSeen = lastNoticeSeen || "";
         this.lastSawEasterEgg = lastSawEasterEgg || 0;
     }
 }
@@ -169,6 +169,54 @@ export const redeemUsernamePassword = async (id, login, password) => {
     return {success: true};
 }
 
+export const redeem2FACode = async (id, code) => {
+    let rateLimit = isRateLimited("auth.riotgames.com");
+    if (rateLimit) return {success: false, rateLimit: rateLimit};
+
+    let user = getUser(id);
+
+    const req = await fetch("https://auth.riotgames.com/api/v1/authorization", {
+        method: "PUT",
+        headers: {
+            'Content-Type': 'application/json',
+            'user-agent': await getUserAgent(),
+            'cookie': stringifyCookies(user.auth.cookies)
+        },
+        body: JSON.stringify({
+            'type': 'multifactor',
+            'code': code.toString(),
+            'rememberDevice': true
+        })
+    });
+    console.assert(req.statusCode === 200, `2FA status code is ${req.statusCode}!`, req);
+
+    rateLimit = checkRateLimit(req, "auth.riotgames.com")
+    if (rateLimit) return {success: false, rateLimit: rateLimit};
+
+    deleteUser(id);
+
+    user.auth = {
+        ...user.auth,
+        cookies: {
+            ...user.auth.cookies,
+            ...parseSetCookie(req.headers['set-cookie'])
+        }
+    };
+
+    const json = JSON.parse(req.body);
+    if (json.error === "multifactor_attempt_failed" || json.type === "error") {
+        console.error("Authentication failure!", json);
+        return {success: false};
+    }
+
+    user = await processAuthResponse(id, {login: user.auth.login, password: atob(user.auth.password || ""), cookies: user.auth.cookies}, json.response.parameters.uri, user);
+
+    delete user.auth.waiting2FA;
+    addUser(user);
+
+    return {success: true};
+}
+
 const processAuthResponse = async (id, authData, redirect, user=null) => {
     if (!user) user = new User({id});
     const [rso, idt] = extractTokensFromUri(redirect);
@@ -215,12 +263,115 @@ const processAuthResponse = async (id, authData, redirect, user=null) => {
     return user;
 }
 
+export const getUserInfo = async (user) => {
+    const req = await fetch("https://auth.riotgames.com/userinfo", {
+        headers: {
+            'Authorization': "Bearer " + user.auth.rso
+        }
+    });
+    console.assert(req.statusCode === 200, `User info status code is ${req.statusCode}!`, req);
+
+    const json = JSON.parse(req.body);
+    if (json.acct) return {
+        puuid: json.sub,
+        username: json.acct.game_name && json.acct.game_name + "#" + json.acct.tag_line
+    }
+}
+
+const getEntitlements = async (user) => {
+    const req = await fetch("https://entitlements.auth.riotgames.com/api/token/v1", {
+        method: "POST",
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': "Bearer " + user.auth.rso
+        }
+    });
+    console.assert(req.statusCode === 200, `Auth status code is ${req.statusCode}!`, req);
+
+    const json = JSON.parse(req.body);
+    return json.entitlements_token;
+}
+
+export const getRegion = async (user) => {
+    const req = await fetch("https://riot-geo.pas.si.riotgames.com/pas/v1/product/valorant", {
+        method: "PUT",
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': "Bearer " + user.auth.rso
+        },
+        body: JSON.stringify({
+            'id_token': user.auth.idt,
+        })
+    });
+    console.assert(req.statusCode === 200, `PAS token status code is ${req.statusCode}!`, req);
+
+    const json = JSON.parse(req.body);
+    return json.affinities.live;
+}
+
+export const redeemCookies = async (id, cookies) => {
+    let rateLimit = isRateLimited("auth.riotgames.com");
+    if (rateLimit) return {success: false, rateLimit: rateLimit};
+
+    const req = await fetch("https://auth.riotgames.com/authorize?redirect_uri=https%3A%2F%2Fplayvalorant.com%2Fopt_in&client_id=play-valorant-web-prod&response_type=token%20id_token&scope=account%20openid&nonce=1", {
+        headers: {
+            'user-agent': await getUserAgent(),
+            cookie: cookies
+        }
+    });
+    console.assert(req.statusCode === 303, `Cookie Reauth status code is ${req.statusCode}!`, req);
+
+    rateLimit = checkRateLimit(req, "auth.riotgames.com");
+    if (rateLimit) return {success: false, rateLimit: rateLimit};
+
+    if (detectCloudflareBlock(req)) return {success: false, rateLimit: "cloudflare"};
+
+    if (req.headers.location.startsWith("/login")) return {success: false}; // invalid cookies
+
+    cookies = {
+        ...parseSetCookie(cookies),
+        ...parseSetCookie(req.headers['set-cookie'])
+    }
+
+    const user = await processAuthResponse(id, {cookies}, req.headers.location);
+    addUser(user);
+
+    return {success: true};
+}
+
+export const refreshToken = async (id, account=null) => {
+    console.log(`Refreshing token for ${id}...`)
+    let response = {success: false}
+
+    let user = getUser(id, account);
+    if (!user) return response;
+
+    if (user.auth.cookies) {
+        response = await queueCookiesLogin(id, stringifyCookies(user.auth.cookies));
+        if (response.inQueue) response = await waitForAuthQueueResponse(response);
+    }
+    if (!response.success && user.auth.login && user.auth.password) {
+        response = await queueUsernamePasswordLogin(id, user.auth.login, atob(user.auth.password));
+        if (response.inQueue) response = await waitForAuthQueueResponse(response);
+    }
+
+    if (!response.success && !response.mfa && !response.rateLimit) deleteUserAuth(user);
+
+    return response;
+}
+
 const getUserAgent = async () => {
     return "ShooterGame/13 Windows/10.0.19043.1.256.64bit";
 }
 
 const detectCloudflareBlock = (req) => {
-    return req.statusCode === 403 && req.headers["x-frame-options"] === "SAMEORIGIN";
+    const blocked = req.statusCode === 403 && req.headers["x-frame-options"] === "SAMEORIGIN";
+
+    if (blocked) {
+        console.error("[ !!! ] Error 1020: Your bot might be rate limited, it's best to check if your IP address/your hosting service is blocked by Riot - try hosting on your own PC to see if it solves the issue?")
+    }
+
+    return blocked;
 }
 
 export const deleteUserAuth = (user) => {
